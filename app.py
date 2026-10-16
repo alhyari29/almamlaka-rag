@@ -1,4 +1,4 @@
-import base64, pathlib
+import base64, os, pathlib
 import gradio as gr
 from rag import answer
 
@@ -29,7 +29,8 @@ CSS = """
 :root { --mm-navy:#1b2231; --mm-surface:#222a3a; --mm-raised:#2a3345; --mm-line:#383e4b;
         --mm-red:#b40013; --mm-red-deep:#971814; --mm-ink:#ffffff; --mm-muted:#a7aebb; }
 footer { display:none !important; }
-.gradio-container { max-width:960px !important; margin:0 auto !important; padding-inline:16px !important; }
+.gradio-container { width:100% !important; max-width:min(960px, 100%) !important; flex:1 1 auto !important;
+                     margin:0 auto !important; padding-inline:16px !important; box-sizing:border-box; }
 
 #mm-header { display:flex; align-items:center; justify-content:space-between; gap:16px;
              padding:18px 0 14px; border-bottom:1px solid var(--mm-line); }
@@ -66,6 +67,11 @@ footer { display:none !important; }
 
 .html-container { padding-inline:0 !important; }
 #mm-note, #mm-note * { color:var(--mm-muted) !important; }
+/* every paragraph picks its own direction (Arabic RTL, English LTR) */
+#mm-chat .prose p, #mm-chat .prose li, #mm-chat .prose h3, #mm-chat .example { unicode-bidi:plaintext; text-align:start; }
+#mm-chat .placeholder-content, #mm-chat .placeholder-content * { text-align:center !important; }
+#mm-ask button { background:var(--mm-red) !important; color:#fff !important; border:0 !important; font-weight:700; }
+#mm-ask button:hover { background:var(--mm-red-deep) !important; }
 #mm-note { text-align:center; color:var(--mm-muted); font-size:.8rem; line-height:1.6; padding:6px 0 18px; }
 :focus-visible { outline:2px solid #ff4d5e !important; outline-offset:2px; }
 
@@ -80,7 +86,13 @@ footer { display:none !important; }
 @keyframes mm-in { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:none; } }
 @keyframes mm-wipe { from { clip-path:inset(0 0 0 100%); } to { clip-path:inset(0); } }
 
+/* let flex parents shrink so the strip scrolls inside itself instead of widening the page */
+.gradio-container, .gradio-container .main, .gradio-container .wrap, .gradio-container .contain, .gradio-container .column,
+.gradio-container .block, .html-container, .html-container .prose { min-width:0 !important; max-width:100%; }
+#mm-strip { max-width:100%; min-width:0; }
+
 @media (max-width:640px) {
+  #mm-header { flex-wrap:wrap; }
   .mm-brand h1 { font-size:1.25rem; }
   .mm-brand img { width:42px; height:42px; }
   .mm-pill { font-size:.8rem; padding:6px 10px; }
@@ -126,16 +138,17 @@ with gr.Blocks(title="مساعد المملكة | Almamlaka TV Assistant", fill_
         chatbot=gr.Chatbot(elem_id="mm-chat", height=540, show_label=False,
                            placeholder=PLACEHOLDER, latex_delimiters=[], sanitize_html=True),
         textbox=gr.Textbox(elem_id="mm-ask", placeholder="اكتب سؤالك هنا… Type your question",
-                           max_length=1000, show_label=False),
+                           max_length=1000, show_label=False, submit_btn="إرسال"),
         examples=["ما هي الميزانية الإجمالية للمشروع؟", "When is the public launch?",
                   "Who do I contact for a technical escalation?", "متى موعد الإطلاق؟"],
-        submit_btn="إرسال",
         cache_examples=False,
         concurrency_limit=4,
+        api_visibility="private",  # UI only; blocks scripted use of the LLM keys
         fill_height=True,
     )
     gr.HTML('<div id="mm-note" dir="rtl">كل إجابة مرفقة باسم الوثيقة والصفحة والقسم.<br>'
             '<span dir="ltr">Every answer cites its document, page and section.</span></div>')
 
 if __name__ == "__main__":
-    demo.launch(theme=theme, css=CSS, js=JS, favicon_path="logo.png" if logo.exists() else None)
+    demo.launch(theme=theme, css=CSS, js=JS, favicon_path="logo.png" if logo.exists() else None,
+                server_name="0.0.0.0", server_port=int(os.getenv("PORT", "7860")))

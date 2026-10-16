@@ -1,0 +1,2 @@
+# only needed to rebuild chunks.json from the PDFs (python ingest.py)
+pymupdf==1.28.2

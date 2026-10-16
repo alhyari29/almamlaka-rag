@@ -1,5 +1,4 @@
-import json, os, re, faiss, numpy as np, openai
-from sentence_transformers import SentenceTransformer
+import json, os, re, time, faiss, numpy as np, openai
 from rank_bm25 import BM25Okapi
 
 chunks = json.load(open("chunks.json", encoding="utf-8"))
@@ -7,8 +6,15 @@ index = faiss.read_index("index.faiss")
 _V = index.reconstruct_n(0, index.ntotal)
 SIM = _V @ _V.T
 POS = {c["id"]: n for n, c in enumerate(chunks)}
-NEIGHBOR_MIN = 0.70  # same-topic threshold, calibrated on this corpus
-model = SentenceTransformer("BAAI/bge-m3", device="cpu")
+NEIGHBOR_MIN = 0.78  # same-topic threshold, calibrated on this corpus
+EMBED_MODEL = "gemini-embedding-001"  # must match index.py
+_emb = openai.OpenAI(api_key=os.environ["GEMINI_API_KEY"], max_retries=2, timeout=15,
+                     base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+
+def embed(texts):
+    r = _emb.embeddings.create(model=EMBED_MODEL, input=texts)
+    v = np.array([e.embedding for e in r.data], dtype="float32")
+    return v / np.linalg.norm(v, axis=1, keepdims=True)
 bm25 = BM25Okapi([c["text"].lower().split() for c in chunks])
 
 PROVIDERS = []  # (client, model), tried in order; any API error -> next one
@@ -16,14 +22,14 @@ if os.getenv("GROQ_API_KEY"):
     _q = openai.OpenAI(api_key=os.environ["GROQ_API_KEY"], max_retries=0, timeout=20,
                        base_url="https://api.groq.com/openai/v1")
     PROVIDERS += [(_q, m.strip()) for m in os.getenv(
-        "GROQ_MODELS", "openai/gpt-oss-120b,qwen/qwen3.8-27b").split(",")]
+        "GROQ_MODELS", "openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b").split(",")]
 if os.getenv("GEMINI_API_KEY"):
     _g = openai.OpenAI(api_key=os.environ["GEMINI_API_KEY"], max_retries=0, timeout=20,
                        base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
     PROVIDERS += [(_g, m.strip()) for m in os.getenv(
         "GEMINI_MODELS", "gemini-3.8-flash,gemini-3.5-flash-lite").split(",")]
 assert PROVIDERS, "set GROQ_API_KEY and/or GEMINI_API_KEY"
-MIN_SCORE = 0.40
+MIN_SCORE = 0.56
 MAX_INPUT = 1000
 DEBUG = os.getenv("DEBUG")
 
@@ -42,7 +48,7 @@ If it contains no document question at all, output its English translation uncha
 SYSTEM = """You are the Almamlaka TV document assistant. Answer ONLY from the <sources> provided.
 Rules:
 1. Use only facts stated in <sources>. If they contain nothing relevant, set "answerable": false.
-2. If they answer only part of the question, answer that part and state clearly what the documents do not specify. Never fill gaps from general knowledge. Connect related facts across sources, e.g. a role named in one section and the person holding it in another.
+2. If they answer only part of the question, answer that part and state clearly what the documents do not specify. Never fill gaps from general knowledge. Example: asked to list 12 items when only 4 are named, set "answerable": true, list the 4 and say the rest are not specified. Connect related facts across sources, e.g. a role named in one section and the person holding it in another.
 3. Put the chunk ids you used in "citations". Never write chunk ids inside "answer" or "conflict_note".
 4. If sources give different values for the same fact (across documents or within one), set "conflict": true and state every value with the document it comes from. A later revision that changes an earlier figure IS a conflict: always flag it, and you may say which source describes itself as the revision. Never silently pick one value.
 5. Do not flag a conflict when facts are about different things (e.g. two different meetings).
@@ -54,18 +60,21 @@ Return JSON only: {{"answerable": bool, "answer": str, "citations": [str], "conf
 
 def llm(system, user, max_tokens):
     err = None
-    for client, m in PROVIDERS:
-        try:
-            r = client.chat.completions.create(
-                model=m, max_tokens=max_tokens, temperature=0,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
-            if DEBUG:
-                print(f"[debug] answered by {m}")
-            return r.choices[0].message.content or ""
-        except openai.APIError as e:
-            if DEBUG:
-                print(f"[debug] {m} failed ({getattr(e, 'status_code', type(e).__name__)}), next")
-            err = e
+    for attempt in range(2):  # second pass after a short pause: rate limits are per-minute
+        if attempt:
+            time.sleep(3)
+        for client, m in PROVIDERS:
+            try:
+                r = client.chat.completions.create(
+                    model=m, max_tokens=max_tokens, temperature=0,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+                if DEBUG:
+                    print(f"[debug] answered by {m}")
+                return r.choices[0].message.content or ""
+            except openai.APIError as e:
+                if DEBUG:
+                    print(f"[debug] {m} failed ({getattr(e, 'status_code', type(e).__name__)}), next")
+                err = e
     raise err
 
 def clean(t):
@@ -97,30 +106,46 @@ def rewrite(history, q):
     out = llm(REWRITE, f"<history>\n{h}\n</history>\n<message>{q}</message>", 2000).strip()
     return out or q
 
+_qcache = {}
+
+def embed_query(q):
+    if q not in _qcache:
+        if len(_qcache) > 512:
+            _qcache.clear()
+        _qcache[q] = embed([q])
+    return _qcache[q]
+
 def retrieve(q, k=10):
-    qv = model.encode([q], normalize_embeddings=True).astype("float32")
-    scores, ids = index.search(qv, len(chunks))
-    dense = [int(i) for i in ids[0]]
     sparse = [int(i) for i in np.argsort(bm25.get_scores(q.lower().split()))[::-1]]
+    try:
+        scores, ids = index.search(embed_query(q), len(chunks))
+        dense, best = [int(i) for i in ids[0]], float(scores[0][0])
+    except openai.APIError as e:  # embedding API down -> keyword-only retrieval
+        print("[warn] embedding failed, using BM25 only:", e)
+        dense, best = [], None
     rrf = {}  # reciprocal rank fusion of dense + BM25
     for ranking in (dense, sparse):
         for r, i in enumerate(ranking):
             rrf[i] = rrf.get(i, 0) + 1 / (60 + r)
     picked, per_doc = [], {}
-    for i in sorted(rrf, key=rrf.get, reverse=True):  # max 3 per doc so every doc is seen
+    for i in sorted(rrf, key=rrf.get, reverse=True):  # max 4 per doc so every doc is seen
         d = chunks[i]["doc"]
         if per_doc.get(d, 0) < 4:
             picked.append(chunks[i]); per_doc[d] = per_doc.get(d, 0) + 1
         if len(picked) == k:
             break
+    # conflict-aware expansion: add same-topic chunks from OTHER documents,
+    # so differing values for the same fact reach the model together
     ids_in = {c["id"] for c in picked}
     for c in list(picked):
         i = POS[c["id"]]
-        for d in {x["doc"] for x in chunks} - {c["doc"]}:
-            j = max((j for j, x in enumerate(chunks) if x["doc"] == d), key=lambda j: SIM[i, j])
-            if SIM[i, j] >= NEIGHBOR_MIN and chunks[j]["id"] not in ids_in and len(picked) < 14:
-                picked.append(chunks[j]); ids_in.add(chunks[j]["id"])
-    return picked, float(scores[0][0])
+        for j in np.argsort(SIM[i])[::-1]:
+            if SIM[i, j] < NEIGHBOR_MIN or len(picked) >= 14:
+                break
+            x = chunks[j]
+            if x["doc"] != c["doc"] and x["id"] not in ids_in:
+                picked.append(x); ids_in.add(x["id"])
+    return picked, best
 
 def answer(q, history):
     q = clean(q.strip())
@@ -131,8 +156,8 @@ def answer(q, history):
         sq = rewrite(history, q)
         hits, best = retrieve(sq)
         if DEBUG:
-            print(f"[debug] query={sq!r} best={best:.3f} hits={[c['id'] for c in hits]}")
-        if best < MIN_SCORE:
+            print(f"[debug] query={sq!r} best={best if best is None else round(best, 3)} hits={[c['id'] for c in hits]}")
+        if best is not None and best < MIN_SCORE:
             return REFUSE[L]
         src = "\n\n".join(
             f'<chunk id="{c["id"]}" doc="{pretty(c["doc"])}" page="{c["page"]}" section="{c["section"]}">\n{c["text"]}\n</chunk>'
