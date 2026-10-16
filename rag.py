@@ -58,6 +58,28 @@ Rules:
 Keep "conflict_note" to one sentence naming the differing values; put details in "answer".
 Return JSON only: {{"answerable": bool, "answer": str, "citations": [str], "conflict": bool, "conflict_note": str}}"""
 
+LAST_MODEL = [None]
+_DEC = json.JSONDecoder()
+
+_HYPHENS = str.maketrans({c: "-" for c in "\u2010\u2011\u2012\u2013\u2014\u2212"})
+
+def norm_id(x):
+    """Chunk ids as models write them: unicode hyphens, stray spaces/brackets."""
+    return str(x).translate(_HYPHENS).strip().strip("[]()").strip()
+
+def parse_json(t):
+    """Last JSON object with an "answerable" key; tolerates <think> blocks and code fences."""
+    t = re.sub(r"<think>.*?</think>", "", t, flags=re.S)
+    found = None
+    for m in re.finditer(r"\{", t):
+        try:
+            obj, _ = _DEC.raw_decode(t, m.start())
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and "answerable" in obj:
+            found = obj
+    return found
+
 def llm(system, user, max_tokens):
     err = None
     for attempt in range(2):  # second pass after a short pause: rate limits are per-minute
@@ -68,6 +90,7 @@ def llm(system, user, max_tokens):
                 r = client.chat.completions.create(
                     model=m, max_tokens=max_tokens, temperature=0,
                     messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+                LAST_MODEL[0] = m
                 if DEBUG:
                     print(f"[debug] answered by {m}")
                 return r.choices[0].message.content or ""
@@ -91,7 +114,7 @@ DOC_NAMES = {"Almamlaka_Project_Overview.pdf": "Project Overview",
 def pretty(doc):
     return DOC_NAMES.get(doc, doc.removesuffix(".pdf").replace("_", " "))
 
-CHUNK_ID = re.compile(r"\s*[\[(]?\s*Almamlaka_[\w-]+(?:\s*,\s*Almamlaka_[\w-]+)*\s*[\])]?")
+CHUNK_ID = re.compile(r"\s*[\[(]?\s*Almamlaka_[\w\-‐-—−]+(?:\s*,\s*Almamlaka_[\w\-‐-—−]+)*\s*[\])]?")
 
 def strip_ids(t):
     return CHUNK_ID.sub("", t).strip()
@@ -158,26 +181,33 @@ def answer(q, history):
         if DEBUG:
             print(f"[debug] query={sq!r} best={best if best is None else round(best, 3)} hits={[c['id'] for c in hits]}")
         if best is not None and best < MIN_SCORE:
+            print(f"[refuse] reason=below relevance gate score={best:.3f}")
             return REFUSE[L]
         src = "\n\n".join(
             f'<chunk id="{c["id"]}" doc="{pretty(c["doc"])}" page="{c["page"]}" section="{c["section"]}">\n{c["text"]}\n</chunk>'
             for c in hits)
-        t = llm(SYSTEM.format(lang="Arabic" if L == "ar" else "English"),
-                f"<sources>\n{src}\n</sources>\n<question>{q}</question>\n"
-                f"<standalone_question>{sq}</standalone_question>", 4000)
+        by_id = {norm_id(c["id"]): c for c in hits}
+        for attempt in range(2):  # retry once if the reply is unusable (not a deliberate refusal)
+            t = llm(SYSTEM.format(lang="Arabic" if L == "ar" else "English"),
+                    f"<sources>\n{src}\n</sources>\n<question>{q}</question>\n"
+                    f"<standalone_question>{sq}</standalone_question>", 4000)
+            out = parse_json(t)
+            if out is None:
+                reason = "unparseable reply"
+            elif not out.get("answerable"):
+                print(f"[refuse] model={LAST_MODEL[0]} reason=not answerable")
+                return REFUSE[L]
+            else:
+                cites = [by_id[norm_id(i)] for i in out.get("citations", []) if norm_id(i) in by_id]
+                if cites:
+                    break
+                reason = "no valid citation"
+            print(f"[refuse] model={LAST_MODEL[0]} reason={reason} attempt={attempt + 1}")
+        else:
+            return REFUSE[L]
     except openai.APIError as e:
         print("[error]", e)
         return ERROR[L]
-    try:
-        out = json.loads(t[t.index("{"):t.rindex("}") + 1])
-    except ValueError:
-        if DEBUG:
-            print("[debug] bad JSON:", t[:300])
-        return REFUSE[L]
-    by_id = {c["id"]: c for c in hits}
-    cites = [by_id[i] for i in out.get("citations", []) if i in by_id]
-    if not out.get("answerable") or not cites:  # no valid citation -> no answer
-        return REFUSE[L]
     msg = strip_ids(out.get("answer", ""))
     if out.get("conflict"):
         head = "⚠️ **تعارض بين المصادر:** " if L == "ar" else "⚠️ **Conflict between sources:** "
