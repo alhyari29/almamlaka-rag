@@ -2,7 +2,10 @@
 
 A retrieval-augmented chatbot that answers questions about the Almamlaka TV **Digital Expansion Initiative** using only three source PDFs. It cites the document, page and section for every answer, flags conflicting information, handles follow-up questions, replies in Arabic or English, and refuses out-of-scope or manipulative requests.
 
-**Live demo:** _link added after deployment_
+**Live demo:** https://almamlaka-assistant.onrender.com  
+**Source:** https://github.com/alhyari29/almamlaka-rag
+
+> Hosted on Render's free tier, which sleeps after inactivity: the first request after a pause can take up to a minute.
 
 | English, multi-turn, conflict | Arabic follow-up | Prompt injection |
 |---|---|---|
@@ -51,7 +54,7 @@ Thresholds were calibrated on this corpus: in-scope queries score 0.61–0.80, o
 
 ### 4. Answering and guardrails
 
-**Strict grounding.** The model must return JSON (`answerable`, `answer`, `citations`, `conflict`, `conflict_note`). The code then checks that every cited chunk id was actually retrieved; an answer with no valid citation is replaced by the refusal message. A model cannot answer from general knowledge and still pass this check.
+**Strict grounding.** The model must return JSON (`answerable`, `answer`, `citations`, `conflict`, `conflict_note`). The code then checks that every cited chunk id was actually retrieved; an answer with no valid citation is replaced by the refusal message. A model cannot answer from general knowledge and still pass this check. Citation ids are normalised first (some models write Unicode hyphens), and a reply that cannot be parsed or cites nothing valid is retried once; a deliberate `answerable: false` is accepted as a refusal.
 
 **Out of scope.** Two layers: a relevance gate before the LLM is called (score < 0.56), then the model's own `answerable: false` for questions that sound related but are not covered (for example "Who is Almamlaka's CEO?").
 
